@@ -100,6 +100,45 @@ __device__ inline void squeeze_uniform_poly(Sponge& g, PolySlot a) {
     }
 }
 
+// Unpack a 256-coefficient polynomial with 3-bit coefficients (ETA - x) directly from KeyView in registers
+// (8 coefficients = 24 bits = 3 bytes per outer iteration; zero local stack arrays).
+__device__ inline void unpack_poly_eta(PolySlot dst, const KeyView& kv, int tenant, int base_off) {
+    for (int g = 0; g < N / 8; ++g) {
+        const int off = base_off + g * 3;
+        const uint32_t w = static_cast<uint32_t>(kv.byte(tenant, off)) |
+                           (static_cast<uint32_t>(kv.byte(tenant, off + 1)) << 8) |
+                           (static_cast<uint32_t>(kv.byte(tenant, off + 2)) << 16);
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int32_t v = ETA - static_cast<int32_t>((w >> (3 * k)) & 0x7u);
+            dst[g * 8 + k] = from_signed(v);
+        }
+    }
+}
+
+// Unpack a 256-coefficient polynomial with 13-bit coefficients (2^12 - x) directly from KeyView in registers
+// (8 coefficients = 104 bits = 13 bytes per outer iteration; zero local stack arrays).
+__device__ inline void unpack_poly_t0(PolySlot dst, const KeyView& kv, int tenant, int base_off) {
+    for (int g = 0; g < N / 8; ++g) {
+        const int off = base_off + g * 13;
+        uint64_t lo = 0;
+        #pragma unroll
+        for (int b = 0; b < 8; ++b) lo |= static_cast<uint64_t>(kv.byte(tenant, off + b)) << (8 * b);
+        uint64_t hi = 0;
+        #pragma unroll
+        for (int b = 0; b < 5; ++b) hi |= static_cast<uint64_t>(kv.byte(tenant, off + 8 + b)) << (8 * b);
+
+        dst[g * 8 + 0] = from_signed(4096 - static_cast<int32_t>((lo >> 0) & 0x1FFFu));
+        dst[g * 8 + 1] = from_signed(4096 - static_cast<int32_t>((lo >> 13) & 0x1FFFu));
+        dst[g * 8 + 2] = from_signed(4096 - static_cast<int32_t>((lo >> 26) & 0x1FFFu));
+        dst[g * 8 + 3] = from_signed(4096 - static_cast<int32_t>((lo >> 39) & 0x1FFFu));
+        dst[g * 8 + 4] = from_signed(4096 - static_cast<int32_t>(((lo >> 52) | (hi << 12)) & 0x1FFFu));
+        dst[g * 8 + 5] = from_signed(4096 - static_cast<int32_t>((hi >> 1) & 0x1FFFu));
+        dst[g * 8 + 6] = from_signed(4096 - static_cast<int32_t>((hi >> 14) & 0x1FFFu));
+        dst[g * 8 + 7] = from_signed(4096 - static_cast<int32_t>((hi >> 27) & 0x1FFFu));
+    }
+}
+
 // Stage 0a of a request: unpack secret key for `tenant`, compute NTT-domain secrets and A_hat.
 __device__ inline void mldsa_prepare_key(PolySlot S, ByteSlot B, const KeyView& kv, int tenant) {
     for (int i = 0; i < 32; ++i) {
@@ -108,32 +147,21 @@ __device__ inline void mldsa_prepare_key(PolySlot S, ByteSlot B, const KeyView& 
     }
     for (int i = 0; i < 64; ++i) B[OFF_TR + i] = kv.byte(tenant, 64 + i);
 
-    uint8_t pk_s1[L * 96];
-    uint8_t pk_s2[K * 96];
-    uint8_t pk_t0[K * 416];
-    for (int i = 0; i < L * 96; ++i) pk_s1[i] = kv.byte(tenant, SK_OFF_S1 + i);
-    for (int i = 0; i < K * 96; ++i) pk_s2[i] = kv.byte(tenant, SK_OFF_S2 + i);
-    for (int i = 0; i < K * 416; ++i) pk_t0[i] = kv.byte(tenant, SK_OFF_T0 + i);
-
-    // s1, s2: 3-bit fields, coefficient = ETA - x. t0: 13-bit fields, coefficient = 2^12 - x.
-    for (int l = 0; l < L; ++l)
-        for (int n = 0; n < N; ++n) {
-            int32_t v = ETA - static_cast<int32_t>(bits_at(pk_s1 + l * 96, n * 3, 3));
-            S[(P_S1 + l) * N + n] = from_signed(v);
-        }
-    for (int i = 0; i < K; ++i)
-        for (int n = 0; n < N; ++n) {
-            int32_t v = ETA - static_cast<int32_t>(bits_at(pk_s2 + i * 96, n * 3, 3));
-            S[(P_S2 + i) * N + n] = from_signed(v);
-        }
-    for (int i = 0; i < K; ++i)
-        for (int n = 0; n < N; ++n) {
-            int32_t v = 4096 - static_cast<int32_t>(bits_at(pk_t0 + i * 416, n * 13, 13));
-            S[(P_T0 + i) * N + n] = from_signed(v);
-        }
-    for (int l = 0; l < L; ++l) ntt(S + (P_S1 + l) * N);
-    for (int i = 0; i < K; ++i) ntt(S + (P_S2 + i) * N);
-    for (int i = 0; i < K; ++i) ntt(S + (P_T0 + i) * N);
+    for (int l = 0; l < L; ++l) {
+        PolySlot s1 = S + (P_S1 + l) * N;
+        unpack_poly_eta(s1, kv, tenant, SK_OFF_S1 + l * 96);
+        ntt(s1);
+    }
+    for (int i = 0; i < K; ++i) {
+        PolySlot s2 = S + (P_S2 + i) * N;
+        unpack_poly_eta(s2, kv, tenant, SK_OFF_S2 + i * 96);
+        ntt(s2);
+    }
+    for (int i = 0; i < K; ++i) {
+        PolySlot t0 = S + (P_T0 + i) * N;
+        unpack_poly_t0(t0, kv, tenant, SK_OFF_T0 + i * 416);
+        ntt(t0);
+    }
 
     // A_hat = ExpandA(rho), sampled directly in the NTT domain (FIPS 204 Algorithm 32).
     for (int r = 0; r < K; ++r)

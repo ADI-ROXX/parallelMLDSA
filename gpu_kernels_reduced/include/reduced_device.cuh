@@ -37,31 +37,21 @@ __device__ inline void prepare_r_key(PolySlot S, ByteSlot B, const KeyView& kv, 
     }
     for (int i = 0; i < 64; ++i) B[OFF_TR + i] = kv.byte(tenant, 64 + i);
 
-    uint8_t pk_s1[L * 96];
-    uint8_t pk_s2[K * 96];
-    uint8_t pk_t0[K * 416];
-    for (int i = 0; i < L * 96; ++i) pk_s1[i] = kv.byte(tenant, SK_OFF_S1 + i);
-    for (int i = 0; i < K * 96; ++i) pk_s2[i] = kv.byte(tenant, SK_OFF_S2 + i);
-    for (int i = 0; i < K * 416; ++i) pk_t0[i] = kv.byte(tenant, SK_OFF_T0 + i);
-
-    for (int l = 0; l < L; ++l)
-        for (int n = 0; n < N; ++n) {
-            int32_t v = ETA - static_cast<int32_t>(bits_at(pk_s1 + l * 96, n * 3, 3));
-            S[(R_S1 + l) * N + n] = from_signed(v);
-        }
-    for (int i = 0; i < K; ++i)
-        for (int n = 0; n < N; ++n) {
-            int32_t v = ETA - static_cast<int32_t>(bits_at(pk_s2 + i * 96, n * 3, 3));
-            S[(R_S2 + i) * N + n] = from_signed(v);
-        }
-    for (int i = 0; i < K; ++i)
-        for (int n = 0; n < N; ++n) {
-            int32_t v = 4096 - static_cast<int32_t>(bits_at(pk_t0 + i * 416, n * 13, 13));
-            S[(R_T0 + i) * N + n] = from_signed(v);
-        }
-    for (int l = 0; l < L; ++l) ntt(S + (R_S1 + l) * N);
-    for (int i = 0; i < K; ++i) ntt(S + (R_S2 + i) * N);
-    for (int i = 0; i < K; ++i) ntt(S + (R_T0 + i) * N);
+    for (int l = 0; l < L; ++l) {
+        PolySlot s1 = S + (R_S1 + l) * N;
+        unpack_poly_eta(s1, kv, tenant, SK_OFF_S1 + l * 96);
+        ntt(s1);
+    }
+    for (int i = 0; i < K; ++i) {
+        PolySlot s2 = S + (R_S2 + i) * N;
+        unpack_poly_eta(s2, kv, tenant, SK_OFF_S2 + i * 96);
+        ntt(s2);
+    }
+    for (int i = 0; i < K; ++i) {
+        PolySlot t0 = S + (R_T0 + i) * N;
+        unpack_poly_t0(t0, kv, tenant, SK_OFF_T0 + i * 416);
+        ntt(t0);
+    }
 }
 
 __device__ inline void prepare_r(PolySlot S, ByteSlot B, const KeyView& kv, int tenant, const uint8_t* msg) {
