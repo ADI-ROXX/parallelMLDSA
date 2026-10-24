@@ -73,6 +73,33 @@ __device__ __forceinline__ int32_t low_bits_centered(uint32_t r) {
     return r0;
 }
 
+// Stream-sample 256 NTT coefficients < Q from a finalized SHAKE128 sponge (rate = 168 bytes = 21 words)
+// directly using a 64-bit register bit-buffer instead of 3-byte sp_squeeze calls.
+__device__ inline void squeeze_uniform_poly(Sponge& g, PolySlot a) {
+    uint64_t bitbuf = 0;
+    int bits_in_buf = 0;
+    int lane_idx = 0;  // 0..20 within each 168-byte (21-word) SHAKE128 block
+    int count = 0;
+    while (count < N) {
+        if (bits_in_buf < 24) {
+            if (lane_idx == 21) {
+                keccak_f(g.s);
+                lane_idx = 0;
+            }
+            const uint64_t w = g.s[lane_idx++];
+            const uint32_t v = static_cast<uint32_t>((bitbuf | (w << bits_in_buf)) & 0x7FFFFFu);
+            bitbuf = w >> (24 - bits_in_buf);
+            bits_in_buf += 64 - 24;
+            if (v < Q) a[count++] = v;
+        } else {
+            const uint32_t v = static_cast<uint32_t>(bitbuf & 0x7FFFFFu);
+            bitbuf >>= 24;
+            bits_in_buf -= 24;
+            if (v < Q) a[count++] = v;
+        }
+    }
+}
+
 // Stage 0a of a request: unpack secret key for `tenant`, compute NTT-domain secrets and A_hat.
 __device__ inline void mldsa_prepare_key(PolySlot S, ByteSlot B, const KeyView& kv, int tenant) {
     for (int i = 0; i < 32; ++i) {
@@ -118,13 +145,7 @@ __device__ inline void mldsa_prepare_key(PolySlot S, ByteSlot B, const KeyView& 
             const uint8_t idx[2] = {static_cast<uint8_t>(s), static_cast<uint8_t>(r)};
             sp_absorb(g, idx, 2);
             sp_finalize(g);
-            int count = 0;
-            while (count < N) {
-                uint8_t t[3];
-                sp_squeeze(g, t, 3);
-                uint32_t v = t[0] | (static_cast<uint32_t>(t[1]) << 8) | (static_cast<uint32_t>(t[2] & 0x7F) << 16);
-                if (v < Q) a[count++] = v;
-            }
+            squeeze_uniform_poly(g, a);
         }
 }
 

@@ -27,13 +27,7 @@ __device__ inline void expand_a_entry(PolySlot a, ByteSlot rho, int r, int s) {
     const uint8_t idx[2] = {static_cast<uint8_t>(s), static_cast<uint8_t>(r)};
     sp_absorb(g, idx, 2);
     sp_finalize(g);
-    int count = 0;
-    while (count < N) {
-        uint8_t t[3];
-        sp_squeeze(g, t, 3);
-        uint32_t v = t[0] | (static_cast<uint32_t>(t[1]) << 8) | (static_cast<uint32_t>(t[2] & 0x7F) << 16);
-        if (v < Q) a[count++] = v;
-    }
+    squeeze_uniform_poly(g, a);
 }
 
 __device__ inline void prepare_r_key(PolySlot S, ByteSlot B, const KeyView& kv, int tenant) {
