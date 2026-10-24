@@ -40,7 +40,7 @@ bool check_kernel(const std::string& kernel, const Keys& keys, const std::vector
     int grid = 0;
     if (reduced) grid = mldsa::reduced::warpsign_reduced_grid_blocks(threads, static_cast<int>(n));
     else if (!naive) grid = mldsa::warpsign_grid_blocks(threads, static_cast<int>(n));
-    const size_t slots = naive ? n : static_cast<size_t>(grid) * threads;
+    const size_t slots = naive ? mldsa::naive_slots(static_cast<int>(n)) : static_cast<size_t>(grid) * threads;
     const size_t num_warps = (slots + 31) / 32;
     const std::vector<uint8_t>& sk_host = soa ? keys.soa : keys.aos;
 

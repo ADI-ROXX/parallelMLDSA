@@ -16,8 +16,8 @@ __global__ void naive_sign_kernel(BatchArgs a) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= a.n) return;
 
-    uint32_t* S = a.scratch + static_cast<size_t>(i) * SCRATCH_WORDS;
-    uint8_t* B = a.bytes + static_cast<size_t>(i) * BYTES_PER_SLOT;
+    PolySlot S = warp_slot<uint32_t, SCRATCH_WORDS>(a.scratch, i);
+    ByteSlot B = warp_slot<uint8_t, BYTES_PER_SLOT>(a.bytes, i);
     const KeyView kv{a.sk, a.soa, a.num_tenants};
 
     const uint64_t t0 = now_ns();

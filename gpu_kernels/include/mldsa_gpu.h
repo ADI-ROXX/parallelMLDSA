@@ -27,8 +27,8 @@ struct BatchArgs {
     int n;
 };
 
-// Slots needed for the naive kernel (one per request) and the persistent warpsign kernel.
-inline size_t naive_slots(int n) { return static_cast<size_t>(n); }
+// Slots needed for the naive kernel (rounded up to full warps for warp-striped SoA scratch).
+inline size_t naive_slots(int n) { return (static_cast<size_t>(n) + 31u) & ~size_t(31u); }
 
 // Launch one thread per request. Warp efficiency is derived from the attempts array.
 void launch_naive(const BatchArgs& args, int threads_per_block, cudaStream_t stream);

@@ -20,11 +20,12 @@ __global__ void warpsign_kernel(BatchArgs a) {
     const int lane = threadIdx.x & 31;
     const int warp_id = gtid >> 5;
 
-    uint32_t* S = a.scratch + static_cast<size_t>(gtid) * SCRATCH_WORDS;
-    uint8_t* B = a.bytes + static_cast<size_t>(gtid) * BYTES_PER_SLOT;
+    PolySlot S = warp_slot<uint32_t, SCRATCH_WORDS>(a.scratch, gtid);
+    ByteSlot B = warp_slot<uint8_t, BYTES_PER_SLOT>(a.bytes, gtid);
     const KeyView kv{a.sk, a.soa, a.num_tenants};
 
     bool active = false;
+    bool pending_prep = false;
     int req = 0;
     uint32_t kappa = 0;
     uint32_t tries = 0;
@@ -40,7 +41,25 @@ __global__ void warpsign_kernel(BatchArgs a) {
     uint64_t iters = 0;
     uint64_t active_sum = 0;
 
-    while (__ballot_sync(FULL, active)) {
+    // Amortized warp-compaction loop: finished lanes pop their next request immediately and mark
+    // `pending_prep`. Expensive key/message preparation runs only when >= 8 lanes in the warp are
+    // waiting to prepare (or no lanes remain in the attempt stage), slashing refill branch stalls.
+    while (__ballot_sync(FULL, active || pending_prep)) {
+        const unsigned prep_mask = __ballot_sync(FULL, pending_prep);
+        const unsigned act_mask = __ballot_sync(FULL, active);
+        if (prep_mask && (__popc(prep_mask) >= 8 || act_mask == 0u)) {
+            if (pending_prep) {
+                t0 = now_ns_ws();
+                mldsa_prepare(S, B, kv, req % a.num_tenants, a.msgs + static_cast<size_t>(req) * MSG_LEN);
+                pending_prep = false;
+                active = true;
+            }
+            __syncwarp(FULL);
+        }
+
+        const int nactive = __popc(__ballot_sync(FULL, active));
+        if (nactive == 0) continue;
+
         bool accepted = false;
         if (active) {
             ++tries;
@@ -52,7 +71,6 @@ __global__ void warpsign_kernel(BatchArgs a) {
             }
         }
 
-        const int nactive = __popc(__ballot_sync(FULL, active));
         if (lane == 0) {
             ++iters;
             active_sum += static_cast<uint64_t>(nactive);
@@ -68,11 +86,9 @@ __global__ void warpsign_kernel(BatchArgs a) {
             req = static_cast<int>(atomicAdd(a.queue, 1u));
             kappa = 0;
             tries = 0;
+            active = false;
             if (req < a.n) {
-                t0 = now_ns_ws();
-                mldsa_prepare(S, B, kv, req % a.num_tenants, a.msgs + static_cast<size_t>(req) * MSG_LEN);
-            } else {
-                active = false;
+                pending_prep = true;
             }
         }
         __syncwarp(FULL);

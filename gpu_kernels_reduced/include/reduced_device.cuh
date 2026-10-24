@@ -20,7 +20,7 @@ constexpr int R_CH = 24;   // 1 poly, NTT(c)
 constexpr int R_TMP = 25;  // 1 poly, c*s1 / c*s2 / c*t0
 constexpr int R_A = 26;    // 1 poly, one entry of A_hat
 
-__device__ inline void expand_a_entry(uint32_t* a, const uint8_t* rho, int r, int s) {
+__device__ inline void expand_a_entry(PolySlot a, ByteSlot rho, int r, int s) {
     Sponge g;
     sp_init(g, 168);
     sp_absorb(g, rho, 32);
@@ -36,7 +36,7 @@ __device__ inline void expand_a_entry(uint32_t* a, const uint8_t* rho, int r, in
     }
 }
 
-__device__ inline void prepare_r(uint32_t* S, uint8_t* B, const KeyView& kv, int tenant, const uint8_t* msg) {
+__device__ inline void prepare_r_key(PolySlot S, ByteSlot B, const KeyView& kv, int tenant) {
     for (int i = 0; i < 32; ++i) {
         B[OFF_RHO + i] = kv.byte(tenant, i);
         B[OFF_K + i] = kv.byte(tenant, 32 + i);
@@ -68,28 +68,15 @@ __device__ inline void prepare_r(uint32_t* S, uint8_t* B, const KeyView& kv, int
     for (int l = 0; l < L; ++l) ntt(S + (R_S1 + l) * N);
     for (int i = 0; i < K; ++i) ntt(S + (R_S2 + i) * N);
     for (int i = 0; i < K; ++i) ntt(S + (R_T0 + i) * N);
+}
 
-    const uint8_t prefix[2] = {0, 0};
-    Sponge sp;
-    sp_init(sp, 136);
-    sp_absorb(sp, B + OFF_TR, 64);
-    sp_absorb(sp, prefix, 2);
-    sp_absorb(sp, msg, MSG_LEN);
-    sp_finalize(sp);
-    sp_squeeze(sp, B + OFF_MU, 64);
-
-    const uint8_t rnd[32] = {0};
-    Sponge sp2;
-    sp_init(sp2, 136);
-    sp_absorb(sp2, B + OFF_K, 32);
-    sp_absorb(sp2, rnd, 32);
-    sp_absorb(sp2, B + OFF_MU, 64);
-    sp_finalize(sp2);
-    sp_squeeze(sp2, B + OFF_RHOPP, 64);
+__device__ inline void prepare_r(PolySlot S, ByteSlot B, const KeyView& kv, int tenant, const uint8_t* msg) {
+    prepare_r_key(S, B, kv, tenant);
+    mldsa_prepare_msg(B, msg);
 }
 
 // One rejection-sampling iteration at counter kappa; writes sig only on acceptance.
-__device__ inline bool attempt_r(uint32_t* S, uint8_t* B, uint8_t* sig, uint32_t kappa) {
+__device__ inline bool attempt_r(PolySlot S, ByteSlot B, uint8_t* sig, uint32_t kappa) {
     for (int l = 0; l < L; ++l) {
         uint8_t stream[576];
         Sponge sp;
@@ -100,8 +87,8 @@ __device__ inline bool attempt_r(uint32_t* S, uint8_t* B, uint8_t* sig, uint32_t
         sp_absorb(sp, ctr, 2);
         sp_finalize(sp);
         sp_squeeze(sp, stream, 576);
-        uint32_t* y = S + (R_Y + l) * N;
-        uint32_t* yh = S + (R_YH + l) * N;
+        PolySlot y = S + (R_Y + l) * N;
+        PolySlot yh = S + (R_YH + l) * N;
         for (int n = 0; n < N; ++n) {
             int32_t x = static_cast<int32_t>(bits_at(stream, n * 18, 18));
             y[n] = from_signed(GAMMA1 - x);
@@ -111,19 +98,19 @@ __device__ inline bool attempt_r(uint32_t* S, uint8_t* B, uint8_t* sig, uint32_t
     }
 
     // w = InvNTT(A_hat * NTT(y)), with A_hat entries regenerated on use
-    uint32_t* a = S + R_A * N;
+    PolySlot a = S + R_A * N;
     for (int i = 0; i < K; ++i) {
-        uint32_t* w = S + (R_W + i) * N;
+        PolySlot w = S + (R_W + i) * N;
         for (int n = 0; n < N; ++n) w[n] = 0;
         for (int j = 0; j < L; ++j) {
             expand_a_entry(a, B + OFF_RHO, i, j);
-            const uint32_t* yh = S + (R_YH + j) * N;
+            const PolySlot yh = S + (R_YH + j) * N;
             for (int n = 0; n < N; ++n) w[n] = addq(w[n], mulq(a[n], yh[n]));
         }
         invntt(w);
     }
 
-    uint8_t* w1 = B + OFF_W1;
+    ByteSlot w1 = B + OFF_W1;
     for (int i = 0; i < W1_BYTES; ++i) w1[i] = 0;
     for (int i = 0; i < K; ++i)
         for (int n = 0; n < N; ++n) {
@@ -132,7 +119,7 @@ __device__ inline bool attempt_r(uint32_t* S, uint8_t* B, uint8_t* sig, uint32_t
         }
 
     shake256_2(B + OFF_MU, 64, w1, W1_BYTES, B + OFF_CT, CTILDE_LEN);
-    uint32_t* ch = S + R_CH * N;
+    PolySlot ch = S + R_CH * N;
     for (int n = 0; n < N; ++n) ch[n] = 0;
     {
         Sponge sp;
@@ -156,12 +143,12 @@ __device__ inline bool attempt_r(uint32_t* S, uint8_t* B, uint8_t* sig, uint32_t
     }
     ntt(ch);
 
-    uint32_t* tmp = S + R_TMP * N;
+    PolySlot tmp = S + R_TMP * N;
     for (int l = 0; l < L; ++l) {
-        const uint32_t* s1h = S + (R_S1 + l) * N;
+        const PolySlot s1h = S + (R_S1 + l) * N;
         for (int n = 0; n < N; ++n) tmp[n] = mulq(ch[n], s1h[n]);
         invntt(tmp);
-        uint32_t* y = S + (R_Y + l) * N;
+        PolySlot y = S + (R_Y + l) * N;
         for (int n = 0; n < N; ++n) {
             y[n] = addq(y[n], tmp[n]);
             int32_t zc = centered(y[n]);
@@ -171,10 +158,10 @@ __device__ inline bool attempt_r(uint32_t* S, uint8_t* B, uint8_t* sig, uint32_t
 
     // Overwrites w with u = w - c*s2 so the hint step can reuse it without storing c*s2.
     for (int i = 0; i < K; ++i) {
-        const uint32_t* s2h = S + (R_S2 + i) * N;
+        const PolySlot s2h = S + (R_S2 + i) * N;
         for (int n = 0; n < N; ++n) tmp[n] = mulq(ch[n], s2h[n]);
         invntt(tmp);
-        uint32_t* w = S + (R_W + i) * N;
+        PolySlot w = S + (R_W + i) * N;
         for (int n = 0; n < N; ++n) {
             w[n] = subq(w[n], tmp[n]);
             int32_t r0 = low_bits_centered(w[n]);
@@ -184,10 +171,10 @@ __device__ inline bool attempt_r(uint32_t* S, uint8_t* B, uint8_t* sig, uint32_t
 
     int hint_count = 0;
     for (int i = 0; i < K; ++i) {
-        const uint32_t* t0h = S + (R_T0 + i) * N;
+        const PolySlot t0h = S + (R_T0 + i) * N;
         for (int n = 0; n < N; ++n) tmp[n] = mulq(ch[n], t0h[n]);
         invntt(tmp);
-        const uint32_t* u_row = S + (R_W + i) * N;
+        const PolySlot u_row = S + (R_W + i) * N;
         for (int n = 0; n < N; ++n) {
             int32_t cc = centered(tmp[n]);
             if (cc >= GAMMA2 || cc <= -GAMMA2) return false;
@@ -205,7 +192,7 @@ __device__ inline bool attempt_r(uint32_t* S, uint8_t* B, uint8_t* sig, uint32_t
     constexpr int Z_OFF = CTILDE_LEN;
     constexpr int H_OFF = Z_OFF + L * N * 18 / 8;
     for (int l = 0; l < L; ++l) {
-        const uint32_t* z = S + (R_Y + l) * N;
+        const PolySlot z = S + (R_Y + l) * N;
         for (int n = 0; n < N; ++n) {
             int32_t v = GAMMA1 - centered(z[n]);
             put_bits(sig + Z_OFF, (l * N + n) * 18, static_cast<uint32_t>(v), 18);

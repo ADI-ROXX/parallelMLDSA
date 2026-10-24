@@ -56,11 +56,36 @@ constexpr int W1_BYTES = K * N * 6 / 8;  // 768
 constexpr int OFF_H = OFF_W1 + W1_BYTES;
 constexpr int BYTES_PER_SLOT = OFF_H + K * N;
 
+// Warp-striped SoA view over per-slot uint32_t or uint8_t scratchpads.
+// Within each warp of 32 threads, element `i` of lane `l` is stored at `warp_base[i * 32 + l]`,
+// so all 32 lanes accessing the same polynomial coefficient or byte offset coalesce into one transaction.
+template <typename T>
+struct WarpSlice {
+    T* base;
+    __device__ __forceinline__ T& operator[](int i) const { return base[i << 5]; }
+    __device__ __forceinline__ WarpSlice<T> operator+(int off) const { return {base + (off << 5)}; }
+};
+
+template <typename T, int WORDS_PER_SLOT>
+__device__ __forceinline__ WarpSlice<T> warp_slot(T* buf, int gtid) {
+    const size_t warp_id = static_cast<size_t>(gtid >> 5);
+    const size_t lane = static_cast<size_t>(gtid & 31);
+    return {buf + warp_id * (32u * static_cast<size_t>(WORDS_PER_SLOT)) + lane};
+}
+
+using PolySlot = WarpSlice<uint32_t>;
+using ByteSlot = WarpSlice<uint8_t>;
+
 // Zeta powers in bit-reversed order (FIPS 204 Appendix B), filled by upload_tables().
 __constant__ uint32_t c_zetas[N];
 
+// Division-free modular multiplication mod Q = 8380417 using 64-bit reciprocal (floor(2^46 / Q) = 8396807).
+// Exact for all a, b < Q without 64-bit integer division instructions.
 __device__ __forceinline__ uint32_t mulq(uint32_t a, uint32_t b) {
-    return static_cast<uint32_t>((static_cast<uint64_t>(a) * b) % Q);
+    const uint64_t p = static_cast<uint64_t>(a) * b;
+    const uint64_t q_est = ((p >> 20) * 8396807ull) >> 26;
+    uint32_t r = static_cast<uint32_t>(p) - static_cast<uint32_t>(q_est) * Q;
+    return r >= Q ? r - Q : r;
 }
 __device__ __forceinline__ uint32_t addq(uint32_t a, uint32_t b) {
     uint32_t s = a + b;
@@ -73,9 +98,9 @@ __device__ __forceinline__ uint32_t subq(uint32_t a, uint32_t b) {
 __device__ __forceinline__ int32_t centered(uint32_t a) {
     return a > (Q - 1) / 2 ? static_cast<int32_t>(a) - static_cast<int32_t>(Q) : static_cast<int32_t>(a);
 }
+// Input v in (-Q, Q); branchless-friendly conversion to [0, Q).
 __device__ __forceinline__ uint32_t from_signed(int32_t v) {
-    int32_t r = v % static_cast<int32_t>(Q);
-    return static_cast<uint32_t>(r < 0 ? r + static_cast<int32_t>(Q) : r);
+    return static_cast<uint32_t>(v < 0 ? v + static_cast<int32_t>(Q) : v);
 }
 
 // Keccak-f[1600] and a byte-oriented sponge for SHAKE128/SHAKE256.
@@ -89,23 +114,31 @@ __device__ inline void keccak_f(uint64_t* a) {
         0x8000000080008081ull, 0x8000000000008080ull, 0x0000000080000001ull, 0x8000000080008008ull};
     constexpr int ROT[25] = {0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43,
                              25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14};
+    #pragma unroll
     for (int round = 0; round < 24; ++round) {
         uint64_t c[5], d[5];
+        #pragma unroll
         for (int x = 0; x < 5; ++x) c[x] = a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20];
+        #pragma unroll
         for (int x = 0; x < 5; ++x) {
             uint64_t r = (c[(x + 1) % 5] << 1) | (c[(x + 1) % 5] >> 63);
             d[x] = c[(x + 4) % 5] ^ r;
         }
+        #pragma unroll
         for (int i = 0; i < 25; ++i) a[i] ^= d[i % 5];
         uint64_t b[25];
+        #pragma unroll
         for (int x = 0; x < 5; ++x)
+            #pragma unroll
             for (int y = 0; y < 5; ++y) {
                 uint64_t v = a[x + 5 * y];
                 int r = ROT[x + 5 * y];
                 uint64_t rv = r == 0 ? v : ((v << r) | (v >> (64 - r)));
                 b[y + 5 * ((2 * x + 3 * y) % 5)] = rv;
             }
+        #pragma unroll
         for (int y = 0; y < 5; ++y)
+            #pragma unroll
             for (int x = 0; x < 5; ++x)
                 a[x + 5 * y] = b[x + 5 * y] ^ (~b[(x + 1) % 5 + 5 * y] & b[(x + 2) % 5 + 5 * y]);
         a[0] ^= RC[round];
@@ -124,7 +157,8 @@ __device__ inline void sp_init(Sponge& sp, int rate) {
     sp.pos = 0;
 }
 
-__device__ inline void sp_absorb(Sponge& sp, const uint8_t* in, int len) {
+template <typename Ptr>
+__device__ inline void sp_absorb(Sponge& sp, Ptr in, int len) {
     for (int i = 0; i < len; ++i) {
         sp.s[sp.pos >> 3] ^= static_cast<uint64_t>(in[i]) << (8 * (sp.pos & 7));
         if (++sp.pos == sp.rate) {
@@ -142,7 +176,8 @@ __device__ inline void sp_finalize(Sponge& sp) {
     sp.pos = 0;
 }
 
-__device__ inline void sp_squeeze(Sponge& sp, uint8_t* out, int len) {
+template <typename Ptr>
+__device__ inline void sp_squeeze(Sponge& sp, Ptr out, int len) {
     for (int i = 0; i < len; ++i) {
         if (sp.pos == sp.rate) {
             keccak_f(sp.s);
@@ -153,7 +188,8 @@ __device__ inline void sp_squeeze(Sponge& sp, uint8_t* out, int len) {
     }
 }
 
-__device__ inline void shake256(const uint8_t* in, int len, uint8_t* out, int outlen) {
+template <typename InPtr, typename OutPtr>
+__device__ inline void shake256(InPtr in, int len, OutPtr out, int outlen) {
     Sponge sp;
     sp_init(sp, 136);
     sp_absorb(sp, in, len);
@@ -162,7 +198,8 @@ __device__ inline void shake256(const uint8_t* in, int len, uint8_t* out, int ou
 }
 
 // Two-segment input, used to hash (prefix || suffix) without copying.
-__device__ inline void shake256_2(const uint8_t* a, int alen, const uint8_t* b, int blen, uint8_t* out, int outlen) {
+template <typename PtrA, typename PtrB, typename OutPtr>
+__device__ inline void shake256_2(PtrA a, int alen, PtrB b, int blen, OutPtr out, int outlen) {
     Sponge sp;
     sp_init(sp, 136);
     sp_absorb(sp, a, alen);
@@ -172,7 +209,8 @@ __device__ inline void shake256_2(const uint8_t* a, int alen, const uint8_t* b, 
 }
 
 // In-place forward NTT (FIPS 204 Algorithm 41).
-__device__ inline void ntt(uint32_t* a) {
+template <typename PolyPtr>
+__device__ inline void ntt(PolyPtr a) {
     int k = 0;
     for (int len = 128; len >= 1; len >>= 1)
         for (int start = 0; start < N; start += 2 * len) {
@@ -186,7 +224,8 @@ __device__ inline void ntt(uint32_t* a) {
 }
 
 // In-place inverse NTT (FIPS 204 Algorithm 42), including the 1/256 scaling.
-__device__ inline void invntt(uint32_t* a) {
+template <typename PolyPtr>
+__device__ inline void invntt(PolyPtr a) {
     constexpr uint32_t INV_N = 8347681u;  // 256^{-1} mod Q
     int k = N;
     for (int len = 1; len < N; len <<= 1)

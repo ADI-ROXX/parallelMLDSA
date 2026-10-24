@@ -18,39 +18,63 @@ struct KeyView {
     }
 };
 
+// Word-level bit extraction (up to 18 bits) from a byte buffer without per-bit looping.
 __device__ __forceinline__ uint32_t bits_at(const uint8_t* buf, int bit_index, int nbits) {
-    uint32_t v = 0;
-    for (int b = 0; b < nbits; ++b) {
-        int bi = bit_index + b;
-        v |= static_cast<uint32_t>((buf[bi >> 3] >> (bi & 7)) & 1) << b;
+    const int byte_idx = bit_index >> 3;
+    const int shift = bit_index & 7;
+    const uint32_t mask = (1u << nbits) - 1u;
+    uint32_t raw = static_cast<uint32_t>(buf[byte_idx]) | (static_cast<uint32_t>(buf[byte_idx + 1]) << 8);
+    if (shift + nbits > 16) {
+        raw |= static_cast<uint32_t>(buf[byte_idx + 2]) << 16;
+        if (shift + nbits > 24) raw |= static_cast<uint32_t>(buf[byte_idx + 3]) << 24;
     }
-    return v;
+    return (raw >> shift) & mask;
 }
 
-__device__ __forceinline__ void put_bits(uint8_t* buf, int bit_index, uint32_t value, int nbits) {
-    for (int b = 0; b < nbits; ++b) {
-        int bi = bit_index + b;
-        if ((value >> b) & 1u) buf[bi >> 3] |= static_cast<uint8_t>(1u << (bi & 7));
+// Word-level bit packing (up to 18 bits) into a zero-initialized byte buffer without per-bit looping.
+template <typename BufPtr>
+__device__ __forceinline__ void put_bits(BufPtr buf, int bit_index, uint32_t value, int nbits) {
+    const int byte_idx = bit_index >> 3;
+    const int shift = bit_index & 7;
+    const uint32_t v = (value & ((1u << nbits) - 1u)) << shift;
+    buf[byte_idx] |= static_cast<uint8_t>(v);
+    if (shift + nbits > 8) {
+        buf[byte_idx + 1] |= static_cast<uint8_t>(v >> 8);
+        if (shift + nbits > 16) {
+            buf[byte_idx + 2] |= static_cast<uint8_t>(v >> 16);
+            if (shift + nbits > 24) buf[byte_idx + 3] |= static_cast<uint8_t>(v >> 24);
+        }
     }
+}
+
+// Division-free decomposition by 2*GAMMA2 = 190464 (floor(2^32 / 190464) + 1 = 22550u).
+__device__ __forceinline__ int32_t div_2gamma2(int32_t rr) {
+    return static_cast<int32_t>((static_cast<uint64_t>(static_cast<uint32_t>(rr)) * 22550ull) >> 32);
 }
 
 // Coefficient of a high-bits decomposition (FIPS 204 Algorithm 37, HighBits).
 __device__ __forceinline__ int32_t high_bits(uint32_t r) {
     int32_t rr = static_cast<int32_t>(r);
-    int32_t r0 = rr % (2 * GAMMA2);
-    if (r0 > GAMMA2) r0 -= 2 * GAMMA2;
+    int32_t q = div_2gamma2(rr);
+    int32_t r0 = rr - q * (2 * GAMMA2);
+    if (r0 > GAMMA2) {
+        r0 -= 2 * GAMMA2;
+        ++q;
+    }
     if (rr - r0 == static_cast<int32_t>(Q) - 1) return 0;
-    return (rr - r0) / (2 * GAMMA2);
+    return q;
 }
 
 __device__ __forceinline__ int32_t low_bits_centered(uint32_t r) {
-    int32_t r0 = static_cast<int32_t>(r) % (2 * GAMMA2);
+    int32_t rr = static_cast<int32_t>(r);
+    int32_t q = div_2gamma2(rr);
+    int32_t r0 = rr - q * (2 * GAMMA2);
     if (r0 > GAMMA2) r0 -= 2 * GAMMA2;
     return r0;
 }
 
-// Stage 0 of a request: unpack key, compute mu, rho'', A_hat and NTT-domain secrets.
-__device__ inline void mldsa_prepare(uint32_t* S, uint8_t* B, const KeyView& kv, int tenant, const uint8_t* msg) {
+// Stage 0a of a request: unpack secret key for `tenant`, compute NTT-domain secrets and A_hat.
+__device__ inline void mldsa_prepare_key(PolySlot S, ByteSlot B, const KeyView& kv, int tenant) {
     for (int i = 0; i < 32; ++i) {
         B[OFF_RHO + i] = kv.byte(tenant, i);
         B[OFF_K + i] = kv.byte(tenant, 32 + i);
@@ -84,6 +108,28 @@ __device__ inline void mldsa_prepare(uint32_t* S, uint8_t* B, const KeyView& kv,
     for (int i = 0; i < K; ++i) ntt(S + (P_S2 + i) * N);
     for (int i = 0; i < K; ++i) ntt(S + (P_T0 + i) * N);
 
+    // A_hat = ExpandA(rho), sampled directly in the NTT domain (FIPS 204 Algorithm 32).
+    for (int r = 0; r < K; ++r)
+        for (int s = 0; s < L; ++s) {
+            PolySlot a = S + (P_AH + r * L + s) * N;
+            Sponge g;
+            sp_init(g, 168);
+            sp_absorb(g, B + OFF_RHO, 32);
+            const uint8_t idx[2] = {static_cast<uint8_t>(s), static_cast<uint8_t>(r)};
+            sp_absorb(g, idx, 2);
+            sp_finalize(g);
+            int count = 0;
+            while (count < N) {
+                uint8_t t[3];
+                sp_squeeze(g, t, 3);
+                uint32_t v = t[0] | (static_cast<uint32_t>(t[1]) << 8) | (static_cast<uint32_t>(t[2] & 0x7F) << 16);
+                if (v < Q) a[count++] = v;
+            }
+        }
+}
+
+// Stage 0b of a request: compute per-message digests mu and rho'' from unpacked key material in B.
+__device__ inline void mldsa_prepare_msg(ByteSlot B, const uint8_t* msg) {
     // mu = H(tr || 0x00 || 0x00 || msg, 64), empty context (FIPS 204 Algorithm 2)
     const uint8_t prefix[2] = {0, 0};
     Sponge sp;
@@ -103,30 +149,17 @@ __device__ inline void mldsa_prepare(uint32_t* S, uint8_t* B, const KeyView& kv,
     sp_absorb(sp2, B + OFF_MU, 64);
     sp_finalize(sp2);
     sp_squeeze(sp2, B + OFF_RHOPP, 64);
+}
 
-    // A_hat = ExpandA(rho), sampled directly in the NTT domain (FIPS 204 Algorithm 32).
-    for (int r = 0; r < K; ++r)
-        for (int s = 0; s < L; ++s) {
-            uint32_t* a = S + (P_AH + r * L + s) * N;
-            Sponge g;
-            sp_init(g, 168);
-            sp_absorb(g, B + OFF_RHO, 32);
-            const uint8_t idx[2] = {static_cast<uint8_t>(s), static_cast<uint8_t>(r)};
-            sp_absorb(g, idx, 2);
-            sp_finalize(g);
-            int count = 0;
-            while (count < N) {
-                uint8_t t[3];
-                sp_squeeze(g, t, 3);
-                uint32_t v = t[0] | (static_cast<uint32_t>(t[1]) << 8) | (static_cast<uint32_t>(t[2] & 0x7F) << 16);
-                if (v < Q) a[count++] = v;
-            }
-        }
+// Full Stage 0 of a request: unpack key, compute mu, rho'', A_hat and NTT-domain secrets.
+__device__ inline void mldsa_prepare(PolySlot S, ByteSlot B, const KeyView& kv, int tenant, const uint8_t* msg) {
+    mldsa_prepare_key(S, B, kv, tenant);
+    mldsa_prepare_msg(B, msg);
 }
 
 // One rejection-sampling iteration (FIPS 204 Algorithm 7, steps 5-29) at counter kappa.
 // Returns true and writes the signature to `sig` on acceptance.
-__device__ inline bool mldsa_attempt(uint32_t* S, uint8_t* B, uint8_t* sig, uint32_t kappa) {
+__device__ inline bool mldsa_attempt(PolySlot S, ByteSlot B, uint8_t* sig, uint32_t kappa) {
     // y = ExpandMask(rho'', kappa), 18-bit fields, coefficient = GAMMA1 - x
     for (int l = 0; l < L; ++l) {
         uint8_t stream[576];
@@ -138,8 +171,8 @@ __device__ inline bool mldsa_attempt(uint32_t* S, uint8_t* B, uint8_t* sig, uint
         sp_absorb(sp, ctr, 2);
         sp_finalize(sp);
         sp_squeeze(sp, stream, 576);
-        uint32_t* y = S + (P_Y + l) * N;
-        uint32_t* yh = S + (P_YH + l) * N;
+        PolySlot y = S + (P_Y + l) * N;
+        PolySlot yh = S + (P_YH + l) * N;
         for (int n = 0; n < N; ++n) {
             int32_t x = static_cast<int32_t>(bits_at(stream, n * 18, 18));
             y[n] = from_signed(GAMMA1 - x);
@@ -150,7 +183,7 @@ __device__ inline bool mldsa_attempt(uint32_t* S, uint8_t* B, uint8_t* sig, uint
 
     // w = InvNTT(A_hat * NTT(y))
     for (int i = 0; i < K; ++i) {
-        uint32_t* w = S + (P_W + i) * N;
+        PolySlot w = S + (P_W + i) * N;
         for (int n = 0; n < N; ++n) {
             uint32_t acc = 0;
             for (int j = 0; j < L; ++j)
@@ -161,7 +194,7 @@ __device__ inline bool mldsa_attempt(uint32_t* S, uint8_t* B, uint8_t* sig, uint
     }
 
     // w1Encode(HighBits(w)), 6 bits per coefficient
-    uint8_t* w1 = B + OFF_W1;
+    ByteSlot w1 = B + OFF_W1;
     for (int i = 0; i < W1_BYTES; ++i) w1[i] = 0;
     for (int i = 0; i < K; ++i)
         for (int n = 0; n < N; ++n) {
@@ -171,7 +204,7 @@ __device__ inline bool mldsa_attempt(uint32_t* S, uint8_t* B, uint8_t* sig, uint
 
     // c_tilde = H(mu || w1Encode(w1), 32); c = SampleInBall(c_tilde); c_hat = NTT(c)
     shake256_2(B + OFF_MU, 64, w1, W1_BYTES, B + OFF_CT, CTILDE_LEN);
-    uint32_t* ch = S + P_CH * N;
+    PolySlot ch = S + P_CH * N;
     for (int n = 0; n < N; ++n) ch[n] = 0;
     {
         Sponge sp;
@@ -197,11 +230,11 @@ __device__ inline bool mldsa_attempt(uint32_t* S, uint8_t* B, uint8_t* sig, uint
 
     // z = y + c*s1, with ||z||inf < GAMMA1 - BETA
     for (int l = 0; l < L; ++l) {
-        uint32_t* cs1 = S + (P_CS1 + l) * N;
-        uint32_t* s1h = S + (P_S1 + l) * N;
+        PolySlot cs1 = S + (P_CS1 + l) * N;
+        PolySlot s1h = S + (P_S1 + l) * N;
         for (int n = 0; n < N; ++n) cs1[n] = mulq(ch[n], s1h[n]);
         invntt(cs1);
-        uint32_t* y = S + (P_Y + l) * N;
+        PolySlot y = S + (P_Y + l) * N;
         for (int n = 0; n < N; ++n) {
             y[n] = addq(y[n], cs1[n]);
             int32_t zc = centered(y[n]);
@@ -211,11 +244,11 @@ __device__ inline bool mldsa_attempt(uint32_t* S, uint8_t* B, uint8_t* sig, uint
 
     // ||LowBits(w - c*s2)||inf < GAMMA2 - BETA
     for (int i = 0; i < K; ++i) {
-        uint32_t* cs2 = S + (P_CS2 + i) * N;
-        uint32_t* s2h = S + (P_S2 + i) * N;
+        PolySlot cs2 = S + (P_CS2 + i) * N;
+        PolySlot s2h = S + (P_S2 + i) * N;
         for (int n = 0; n < N; ++n) cs2[n] = mulq(ch[n], s2h[n]);
         invntt(cs2);
-        uint32_t* w = S + (P_W + i) * N;
+        PolySlot w = S + (P_W + i) * N;
         for (int n = 0; n < N; ++n) {
             int32_t r0 = low_bits_centered(subq(w[n], cs2[n]));
             if (r0 >= GAMMA2 - BETA || r0 <= -(GAMMA2 - BETA)) return false;
@@ -223,14 +256,14 @@ __device__ inline bool mldsa_attempt(uint32_t* S, uint8_t* B, uint8_t* sig, uint
     }
 
     // ||c*t0||inf < GAMMA2, then hints h = MakeHint(-ct0, w - cs2 + ct0) stored in B[OFF_H..]
-    uint32_t* ct0 = S + P_TMP * N;
+    PolySlot ct0 = S + P_TMP * N;
     int hint_count = 0;
     for (int i = 0; i < K; ++i) {
-        uint32_t* t0h = S + (P_T0 + i) * N;
+        PolySlot t0h = S + (P_T0 + i) * N;
         for (int n = 0; n < N; ++n) ct0[n] = mulq(ch[n], t0h[n]);
         invntt(ct0);
-        uint32_t* w = S + (P_W + i) * N;
-        uint32_t* cs2 = S + (P_CS2 + i) * N;
+        PolySlot w = S + (P_W + i) * N;
+        PolySlot cs2 = S + (P_CS2 + i) * N;
         for (int n = 0; n < N; ++n) {
             int32_t cc = centered(ct0[n]);
             if (cc >= GAMMA2 || cc <= -GAMMA2) return false;
@@ -249,7 +282,7 @@ __device__ inline bool mldsa_attempt(uint32_t* S, uint8_t* B, uint8_t* sig, uint
     constexpr int Z_OFF = CTILDE_LEN;
     constexpr int H_OFF = Z_OFF + L * N * 18 / 8;
     for (int l = 0; l < L; ++l) {
-        const uint32_t* z = S + (P_Y + l) * N;
+        const PolySlot z = S + (P_Y + l) * N;
         for (int n = 0; n < N; ++n) {
             int32_t v = GAMMA1 - centered(z[n]);
             put_bits(sig + Z_OFF, (l * N + n) * 18, static_cast<uint32_t>(v), 18);
