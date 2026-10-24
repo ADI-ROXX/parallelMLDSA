@@ -78,7 +78,6 @@ __device__ inline void prepare_r(PolySlot S, ByteSlot B, const KeyView& kv, int 
 // One rejection-sampling iteration at counter kappa; writes sig only on acceptance.
 __device__ inline bool attempt_r(PolySlot S, ByteSlot B, uint8_t* sig, uint32_t kappa) {
     for (int l = 0; l < L; ++l) {
-        uint8_t stream[576];
         Sponge sp;
         sp_init(sp, 136);
         sp_absorb(sp, B + OFF_RHOPP, 64);
@@ -86,14 +85,9 @@ __device__ inline bool attempt_r(PolySlot S, ByteSlot B, uint8_t* sig, uint32_t 
         const uint8_t ctr[2] = {static_cast<uint8_t>(ctr_val & 0xFF), static_cast<uint8_t>((ctr_val >> 8) & 0xFF)};
         sp_absorb(sp, ctr, 2);
         sp_finalize(sp);
-        sp_squeeze(sp, stream, 576);
         PolySlot y = S + (R_Y + l) * N;
         PolySlot yh = S + (R_YH + l) * N;
-        for (int n = 0; n < N; ++n) {
-            int32_t x = static_cast<int32_t>(bits_at(stream, n * 18, 18));
-            y[n] = from_signed(GAMMA1 - x);
-            yh[n] = y[n];
-        }
+        expand_mask_poly(sp, y, yh);
         ntt(yh);
     }
 

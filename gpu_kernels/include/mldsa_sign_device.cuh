@@ -157,12 +157,41 @@ __device__ inline void mldsa_prepare(PolySlot S, ByteSlot B, const KeyView& kv, 
     mldsa_prepare_msg(B, msg);
 }
 
+// Stream-unpack 256 18-bit mask coefficients directly from a finalized SHAKE256 sponge (rate = 136 bytes)
+// into `y` and `yh` without allocating a 576-byte local stack buffer.
+__device__ inline void expand_mask_poly(Sponge& sp, PolySlot y, PolySlot yh) {
+    uint64_t bitbuf = 0;
+    int bits_in_buf = 0;
+    int lane_idx = 0;  // 0..16 within each 136-byte (17-word) SHAKE256 block
+    for (int n = 0; n < N; ++n) {
+        if (bits_in_buf < 18) {
+            if (lane_idx == 17) {
+                keccak_f(sp.s);
+                lane_idx = 0;
+            }
+            const uint64_t w = sp.s[lane_idx++];
+            const uint32_t x = static_cast<uint32_t>((bitbuf | (w << bits_in_buf)) & 0x3FFFFu);
+            bitbuf = w >> (18 - bits_in_buf);
+            bits_in_buf += 64 - 18;
+            const uint32_t val = from_signed(GAMMA1 - static_cast<int32_t>(x));
+            y[n] = val;
+            yh[n] = val;
+        } else {
+            const uint32_t x = static_cast<uint32_t>(bitbuf & 0x3FFFFu);
+            bitbuf >>= 18;
+            bits_in_buf -= 18;
+            const uint32_t val = from_signed(GAMMA1 - static_cast<int32_t>(x));
+            y[n] = val;
+            yh[n] = val;
+        }
+    }
+}
+
 // One rejection-sampling iteration (FIPS 204 Algorithm 7, steps 5-29) at counter kappa.
 // Returns true and writes the signature to `sig` on acceptance.
 __device__ inline bool mldsa_attempt(PolySlot S, ByteSlot B, uint8_t* sig, uint32_t kappa) {
     // y = ExpandMask(rho'', kappa), 18-bit fields, coefficient = GAMMA1 - x
     for (int l = 0; l < L; ++l) {
-        uint8_t stream[576];
         Sponge sp;
         sp_init(sp, 136);
         sp_absorb(sp, B + OFF_RHOPP, 64);
@@ -170,14 +199,9 @@ __device__ inline bool mldsa_attempt(PolySlot S, ByteSlot B, uint8_t* sig, uint3
         const uint8_t ctr[2] = {static_cast<uint8_t>(ctr_val & 0xFF), static_cast<uint8_t>((ctr_val >> 8) & 0xFF)};
         sp_absorb(sp, ctr, 2);
         sp_finalize(sp);
-        sp_squeeze(sp, stream, 576);
         PolySlot y = S + (P_Y + l) * N;
         PolySlot yh = S + (P_YH + l) * N;
-        for (int n = 0; n < N; ++n) {
-            int32_t x = static_cast<int32_t>(bits_at(stream, n * 18, 18));
-            y[n] = from_signed(GAMMA1 - x);
-            yh[n] = y[n];
-        }
+        expand_mask_poly(sp, y, yh);
         ntt(yh);
     }
 

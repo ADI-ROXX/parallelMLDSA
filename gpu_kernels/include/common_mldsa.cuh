@@ -159,11 +159,25 @@ __device__ inline void sp_init(Sponge& sp, int rate) {
 
 template <typename Ptr>
 __device__ inline void sp_absorb(Sponge& sp, Ptr in, int len) {
-    for (int i = 0; i < len; ++i) {
-        sp.s[sp.pos >> 3] ^= static_cast<uint64_t>(in[i]) << (8 * (sp.pos & 7));
-        if (++sp.pos == sp.rate) {
-            keccak_f(sp.s);
-            sp.pos = 0;
+    int i = 0;
+    while (i < len) {
+        if ((sp.pos & 7) == 0 && i + 8 <= len && sp.pos + 8 <= sp.rate) {
+            uint64_t w = 0;
+            #pragma unroll
+            for (int b = 0; b < 8; ++b) w |= static_cast<uint64_t>(in[i + b]) << (8 * b);
+            sp.s[sp.pos >> 3] ^= w;
+            sp.pos += 8;
+            i += 8;
+            if (sp.pos == sp.rate) {
+                keccak_f(sp.s);
+                sp.pos = 0;
+            }
+        } else {
+            sp.s[sp.pos >> 3] ^= static_cast<uint64_t>(in[i++]) << (8 * (sp.pos & 7));
+            if (++sp.pos == sp.rate) {
+                keccak_f(sp.s);
+                sp.pos = 0;
+            }
         }
     }
 }
@@ -178,13 +192,22 @@ __device__ inline void sp_finalize(Sponge& sp) {
 
 template <typename Ptr>
 __device__ inline void sp_squeeze(Sponge& sp, Ptr out, int len) {
-    for (int i = 0; i < len; ++i) {
+    int i = 0;
+    while (i < len) {
         if (sp.pos == sp.rate) {
             keccak_f(sp.s);
             sp.pos = 0;
         }
-        out[i] = static_cast<uint8_t>(sp.s[sp.pos >> 3] >> (8 * (sp.pos & 7)));
-        ++sp.pos;
+        if ((sp.pos & 7) == 0 && i + 8 <= len && sp.pos + 8 <= sp.rate) {
+            const uint64_t w = sp.s[sp.pos >> 3];
+            #pragma unroll
+            for (int b = 0; b < 8; ++b) out[i + b] = static_cast<uint8_t>(w >> (8 * b));
+            sp.pos += 8;
+            i += 8;
+        } else {
+            out[i++] = static_cast<uint8_t>(sp.s[sp.pos >> 3] >> (8 * (sp.pos & 7)));
+            ++sp.pos;
+        }
     }
 }
 
